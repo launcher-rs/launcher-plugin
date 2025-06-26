@@ -5,6 +5,7 @@ edition = "2024"
 authors = ["cyberdoors"]
 keywords = ["flowlauncher", "plugins", "launcher"]
 description = "Flow Launcher 插件rust开发库"
+repository = "https://github.com/launcher-rs/launcher-plugin.git"
 license = "MIT"
 
 
