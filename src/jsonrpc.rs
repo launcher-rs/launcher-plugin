@@ -1,8 +1,10 @@
 use crate::error::LauncherError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::io::Write as _;
 
 /// JsonRPC 请求数据
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct JsonRpcRequest {
     pub method: Method,
     pub parameters: Vec<Option<String>>,
@@ -11,10 +13,23 @@ pub struct JsonRpcRequest {
     pub error: serde_json::Value,
 }
 
+impl Default for JsonRpcRequest {
+    fn default() -> Self {
+        Self {
+            method: Method::Query,
+            parameters: Vec::new(),
+            settings: serde_json::Value::Object(serde_json::Map::new()),
+            id: 0,
+            error: serde_json::Value::Null,
+        }
+    }
+}
+
 /// JsonRPC 请求方法
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub enum Method {
     /// 查询方法
+    #[default]
     Query,
     /// 设置菜单方法
     ContextMenu,
@@ -53,31 +68,45 @@ impl<'de> Deserialize<'de> for Method {
 }
 
 impl JsonRpcRequest {
-    /// 将JsonRPC请求反序列化
-    pub fn from(argument: &String) -> Result<Self, LauncherError> {
-        let input = serde_json::from_str::<JsonRpcRequest>(argument)?;
+    /// 从 JSON 文本解析请求。
+    pub fn from(argument: impl AsRef<str>) -> Result<Self, LauncherError> {
+        let input = serde_json::from_str::<JsonRpcRequest>(argument.as_ref())?;
         Ok(input)
     }
 
-    /// 获取第一个参数
-    pub fn get_parameter(&self) -> String {
-        self.parameters[0].clone().unwrap_or("".to_string())
+    /// 按索引安全读取参数；缺失或为 null 时返回 `None`。
+    pub fn parameter(&self, index: usize) -> Option<&str> {
+        self.parameters.get(index).and_then(Option::as_deref)
     }
 
-    /// 设置响应
+    /// 按索引读取参数，缺失或为 null 时返回空字符串。
+    pub fn parameter_or_default(&self, index: usize) -> String {
+        self.parameter(index).unwrap_or_default().to_string()
+    }
+
+    /// 将响应以单行 JSON 写到标准输出。诊断日志应写到标准错误。
     pub fn set_response(&self, response: JsonRpcResponse) -> Result<(), LauncherError> {
-        println!("{}", response.to_unicode_string()?);
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        serde_json::to_writer(&mut stdout, &response)?;
+        stdout.write_all(b"\n")?;
+        stdout.flush()?;
         Ok(())
     }
 
-    /// 设置简单响应
-    pub fn set_simple_response<S: Into<String>>(
+    /// 构建并输出一条简单结果。
+    pub fn set_simple_response<T, S, I>(
         &self,
-        title: S,
+        title: T,
         sub_title: S,
-        icon_path: S,
+        icon_path: I,
         action: Option<JsonRpcAction>,
-    ) -> Result<(), LauncherError> {
+    ) -> Result<(), LauncherError>
+    where
+        T: Into<String>,
+        S: Into<String>,
+        I: Into<String>,
+    {
         let mut query_data = JsonRpcResponse::new();
         let item = JsonRpcResponseDataBuilder::new()
             .title(title)
@@ -87,15 +116,11 @@ impl JsonRpcRequest {
             .build();
 
         query_data.add_data(item);
-        let response = query_data.to_unicode_string().unwrap();
-        tracing::info!("simple_response响应数据: {}", response);
-
-        println!("{}", response);
-        Ok(())
+        self.set_response(query_data)
     }
 
     /// 转换为字符串，方便调试
-    pub fn to_string(&self) -> Result<String, LauncherError> {
+    pub fn to_json_string(&self) -> Result<String, LauncherError> {
         Ok(serde_json::to_string(&self)?)
     }
 }
@@ -114,7 +139,11 @@ pub struct JsonRpcAction {
 impl JsonRpcAction {
     /// 自定义动作，需要自己手动处理响应
     /// method: 自定义名称
-    pub fn custom<S: Into<String>>(method: S, parameters: Vec<S>) -> Self {
+    pub fn custom<M, P>(method: M, parameters: Vec<P>) -> Self
+    where
+        M: Into<String>,
+        P: Into<String>,
+    {
         Self {
             method: method.into(),
             parameters: parameters.into_iter().map(|s| s.into()).collect(),
@@ -147,9 +176,8 @@ impl JsonRpcAction {
         }
     }
 
-    /// 官方API:Save everything, all of Flow Launcher and plugins' data and settings
-    /// 保存所有内容，包括 Flow Launcher 和插件的所有数据和设置
-    pub fn save_app_all_setings() -> Self {
+    /// 请求宿主保存应用及插件配置。
+    pub fn save_app_all_settings() -> Self {
         Self {
             method: "Flow.Launcher.SaveAppAllSettings".to_string(),
             parameters: vec![],
@@ -280,24 +308,15 @@ impl JsonRpcResponse {
         self.result.push(data);
     }
 
-    /// 有中文会报错，使用unicode转义
-    pub fn to_unicode_string(&self) -> Result<String, LauncherError> {
-        let data = serde_json::to_string(&self)?;
-        Ok(self.escape_non_ascii(&data))
+    /// 序列化为标准 JSON 字符串，Unicode 字符会被正确保留。
+    pub fn to_json_string(&self) -> Result<String, LauncherError> {
+        Ok(serde_json::to_string(self)?)
     }
+}
 
-    /// 将中文转换为 unicode
-    fn escape_non_ascii(&self, s: &str) -> String {
-        let mut escaped = String::with_capacity(s.len());
-        for ch in s.chars() {
-            if ch.is_ascii() {
-                escaped.push(ch);
-            } else {
-                let code = ch as u32;
-                escaped.push_str(&format!("\\u{:04x}", code));
-            }
-        }
-        escaped
+impl Default for JsonRpcResponse {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -355,13 +374,19 @@ impl JsonRpcResponseDataBuilder {
     }
 
     /// 构建JsonRpcResponseData 响应数据
-    pub fn build(&self) -> JsonRpcResponseData {
+    pub fn build(self) -> JsonRpcResponseData {
         JsonRpcResponseData {
-            title: self.title.clone(),
-            sub_title: self.sub_title.clone(),
+            title: self.title,
+            sub_title: self.sub_title,
             score: self.score,
-            ico_path: self.ico_path.clone(),
-            json_rpcaction: self.json_rpcaction.clone(),
+            ico_path: self.ico_path,
+            json_rpcaction: self.json_rpcaction,
         }
+    }
+}
+
+impl Default for JsonRpcResponseDataBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
